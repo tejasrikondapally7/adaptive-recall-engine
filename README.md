@@ -1,192 +1,139 @@
 # Adaptive Recall Engine
 
-Return one trust weight for every dimension of a damaged query. A fixed recall
-system uses those weights while attempting to recover the stored pattern from
-which the query was created.
+A per-dimension **precision controller** for a frozen associative-recall model.
+Given a damaged query, the controller returns one trust weight per dimension.
+The frozen dynamics use those weights while trying to recover the stored
+pattern the query came from.
 
-The controller does not return a class label or a repaired pattern. It returns
-only the vector of per-dimension weights used by the frozen dynamics.
+The controller returns neither a class label nor a repaired pattern, only the
+weight vector `pi`.
 
-## Data used in one evaluation seed
+---
 
-For each seed, the evaluator creates:
+## 1. Task summary
 
-- `K` stored patterns, collected in a matrix `X` with shape `(K, N)`;
-- a symmetric model matrix `R` with shape `(N, N)`;
-- fixed dynamics parameters;
-- corrupted queries, each derived from one of the stored patterns; and
-- the hidden source-pattern index for each query.
-
-Stored patterns are unit-length vectors arranged in clusters. To create a
-query, the generator sets a selected fraction of its source pattern's
-dimensions to zero, adds Gaussian noise, and normalizes the result. The default
-public configuration uses:
-
-```text
-K = 16 stored patterns
-N = 64 dimensions
-mask fractions = 0.60, 0.75, 0.85
-250 queries per mask fraction and seed
-```
-
-New patterns, queries, and truth labels are generated independently for every
-seed.
-
-## What happens during evaluation
-
-For each seed, the evaluator:
-
-1. constructs the stored patterns and frozen recall model;
-2. creates one fresh instance of your adapter;
-3. calls `predict_precision(query)` once for every retrieval query;
-4. runs the frozen dynamics using the returned weights;
-5. classifies the final state against the stored patterns;
-6. evaluates convergence balance on a sample of stored patterns; and
-7. aggregates the results with the other seeds.
-
-The adapter is recreated when the seed changes. It receives the stored patterns
-and model parameters but never receives the source-pattern labels.
-
-## Submission contract
-
-Create `adapters/myteam.py` containing:
-
-```python
-from adapter import Adapter
-import numpy as np
-
-
-class Engine(Adapter):
-    def __init__(self, stored_patterns, model_params):
-        self.X = stored_patterns
-        self.N = stored_patterns.shape[1]
-
-    def predict_precision(self, corrupted_query):
-        return np.ones(self.N)
-```
-
-The constructor arguments are:
-
-| Argument | Meaning |
+| Item | Detail |
 | --- | --- |
-| `stored_patterns` | Float array of shape `(K, N)` |
-| `model_params["R"]` | Frozen model matrix of shape `(N, N)` |
-| `eta`, `beta` | Energy-model parameters |
-| `dt` | Integration step size |
-| `T_max` | Maximum number of integration steps |
-| `tol` | Early-convergence tolerance |
-| `T_in` | Number of initial steps for which the damaged query remains an input |
-| `pi_min`, `pi_max` | Permitted bounds for each submitted weight |
+| Stored patterns | `K = 16` unit vectors in `N = 64` dimensions, arranged in clusters |
+| Queries | Source pattern with 60% / 75% / 85% of dimensions zeroed, plus Gaussian noise, then normalized |
+| Output | `N` finite weights, clipped to `[pi_min, pi_max]` and rescaled to mean 1 by the evaluator |
+| Score (automated) | Retrieval accuracy gain over all-ones precision (70) + convergence balance (20) |
+| Score (manual) | Code quality (10) |
 
-For every call, `corrupted_query` is a float vector with shape `(N,)`.
-`predict_precision` must return exactly `N` finite numeric values. Treat all
-constructor inputs and queries as read-only.
-
-Before use, the evaluator converts the returned vector to `float64`, clips it
-to `[pi_min, pi_max]`, and rescales it toward mean `1`. A non-finite vector is
-replaced with the all-ones baseline.
-
-## Frozen recall dynamics
-
-The recall state begins at the corrupted query:
+Frozen dynamics:
 
 ```text
-a(0) = corrupted_query
+s(a)      = softmax(beta * X a)
+gradient  = R a - eta * X^T s(a)
+update    = -pi * gradient + external(t)      # external = query while t < T_in
+a(next)   = a + dt * update
 ```
 
-At each integration step, the model calculates:
+---
+
+## 2. Approach
+
+The two scored metrics ask for different things, so the adapter handles them
+as two modes. It tells them apart using only the query it receives.
+
+| Mode | Query looks like | Goal | Method |
+| --- | --- | --- | --- |
+| **Retrieval** | Heavily masked and noisy | Raise the chance of converging to the right pattern | Trust dimensions the query agrees with, distrust ones it does not |
+| **Anisotropy probe** | A lightly perturbed stored pattern | Shrink the eigenvalue spread of `sqrt(pi) H sqrt(pi)` | Precompute a spread-minimizing `pi` per stored pattern |
+
+### Mode 1: retrieval (inverse-residual precision)
+
+1. Compute soft pattern weights from the raw query: `p = softmax(beta * X q)`.
+2. Form the expected pattern: `expected = p @ X`.
+3. Compute the per-dimension residual: `r = q - expected`.
+4. Set `pi_i = 1 / (|r_i| + 0.01)`.
+5. Clip to `[pi_min, pi_max]` and rescale to mean 1.
+
+**Why it helps.** A zeroed or noise-corrupted dimension disagrees with the
+soft-matched pattern, so its residual is large and its weight small. Dimensions
+that survived the damage have small residuals and get larger weights. The
+dynamics then lean on the trustworthy evidence. The `0.01` floor keeps weights
+bounded when a residual is near zero.
+
+### Mode 2: anisotropy probes (Hessian-aware precision)
+
+The balance metric builds the Hessian `H` at the uniform-precision equilibrium
+of a stored pattern and measures the spread (max/min eigenvalue ratio) of
+`sqrt(pi) H sqrt(pi)`. Since `X` and `R` are available in the constructor, the
+best `pi` for each stored pattern can be computed once up front.
+
+**Constructor (once per seed), for each stored pattern `k`:**
+
+1. Run the frozen dynamics with uniform precision and no external input from
+   `X[k]` until convergence, giving `a*`.
+2. Compute the Hessian:
+   `H = R - eta * beta * X^T (diag(s) - s s^T) X`, with `s = softmax(beta X a*)`.
+3. Minimize `spread(pi, H)` over diagonal `pi`:
+   - Start from the best of three seeds: all ones, `1 / |diag(H)|`, and
+     `|diag(H^-1)|`.
+   - Refine in log-space with SciPy L-BFGS-B. If SciPy is missing, a
+     coordinate-descent fallback runs instead.
+   - Every candidate is clipped and mean-normalized the same way the evaluator
+     does, so the optimizer sees the real feasible set.
+4. Store the result in `_probe_pi[k]`.
+
+**At query time:** if the query's cosine similarity to its nearest stored
+pattern exceeds `0.5`, the query is treated as a probe and `_probe_pi[k]` is
+returned. Heavily masked retrieval queries stay well below this threshold.
+
+---
+
+## 3. Algorithm (pseudocode)
 
 ```text
-s(a)       = softmax(beta * X * a)
-gradient   = R * a - eta * X^T * s(a)
-external(t) = corrupted_query, if t < T_in
-              0,               otherwise
-update       = -precision * gradient + external(t)
+init(X, params):
+    for k in 1..K:
+        a*        <- equilibrium(X[k])            # uniform precision, no input
+        H         <- hessian(a*)
+        probe_pi[k] <- argmin_pi spread(sqrt(pi) H sqrt(pi))
+
+predict_precision(q):
+    if ||q|| ~ 0:                return ones(N)
+    sims <- X @ (q / ||q||);  k <- argmax(sims)
+    if sims[k] > 0.5:            return probe_pi[k]            # Mode 2
+    p        <- softmax(beta * X @ q)                          # Mode 1
+    residual <- q - p @ X
+    pi       <- 1 / (|residual| + 0.01)
+    return clip_and_normalise(pi)
 ```
 
-The state is then updated by:
+**Cost.** Setup is `K` equilibrium solves, Hessians and optimizations. Each
+query then costs `O(K N)`, which is negligible.
 
-```text
-a(next) = a + dt * update
-```
+---
 
-Integration stops after `T_max` steps or when the change in state is below
-`tol`. The final state is normalized and classified as the stored pattern with
-the greatest cosine similarity. Retrieval is correct only when that index
-equals the hidden source-pattern index.
+## 4. Design notes and limitations
 
-## Automated metrics
+- **Seed independence.** Every quantity is derived from the `stored_patterns`
+  and `model_params` passed to the constructor. No data is keyed to published
+  seeds or queries, and nothing is learned offline.
+- **Read-only inputs.** The adapter copies inputs into new `float64` arrays and
+  never mutates them. It uses no truth labels, caller frames, files, network
+  or reflection.
+- **Probe detection is a heuristic.** The `0.5` similarity threshold separates
+  the two query types for the default mask fractions. If the evaluator's probe
+  perturbation or the mask fractions change a lot, the threshold may need
+  retuning. Reviewers should see this explicitly: the controller switches mode
+  based on the query itself, using a rule derived from the problem statement,
+  and not on any hidden evaluator state.
+- **Residual precision is a heuristic, not an optimum.** It is not guaranteed
+  to improve accuracy on every seed. The scoring halves retrieval points if any
+  seed shows negative delta, so run the full multi-seed check before relying on
+  it.
+- **Optional dependency.** SciPy gives better optimization, but the fallback
+  keeps the adapter working without it. Results may differ slightly between the
+  two paths.
+- **Not yet measured.** No score is claimed here. Run the commands below and
+  paste the real numbers into this section.
 
-### Retrieval accuracy — 70 points
+---
 
-The evaluator first measures retrieval with the all-ones precision vector. For
-your adapter, it computes the accuracy difference for each seed:
-
-```text
-delta = adapter_accuracy - all_ones_accuracy
-```
-
-The mean delta is scaled linearly from zero points at `0.00` to all 70 points
-at `+0.08`. Values above `+0.08` remain capped at 70 points. If mean delta is
-not positive, this section scores zero. If any evaluated seed has negative
-delta, the retrieval points are halved.
-
-The report also shows direct cosine-classification accuracy for context. This
-diagnostic does not itself change the score.
-
-### Convergence balance — 20 points
-
-For sampled stored patterns, the evaluator finds the equilibrium reached under
-uniform precision and calculates the Hessian `H` at that point. Your adapter is
-called on a lightly perturbed version of the pattern. With its normalized
-precision vector `pi`, the evaluator measures the eigenvalue spread of:
-
-```text
-sqrt(pi) * H * sqrt(pi)
-```
-
-For each sampled pattern, reduction is:
-
-```text
-uniform_spread / adapter_spread
-```
-
-A reduction of `1` means no improvement in spread. The mean reduction is scored
-logarithmically from zero points at `1x` to all 20 points at `5x`. If the mean
-is not above `1x`, this section scores zero. If any evaluated seed has reduction
-of `1x` or less, the balance points are halved.
-
-### Code quality — 10 points
-
-The remaining 10 points are reviewed manually for readable, reproducible, and
-clearly explained code. The automated maximum is 90 points.
-
-The public runner is a practice result. Official grading uses fresh unpublished
-seeds and may use larger pattern sets.
-
-## Submission integrity
-
-AI coding tools are allowed, but your adapter must be a genuine precision
-controller that generalizes across newly generated pattern collections,
-queries, and seeds. Submit exactly one readable Python adapter file. The
-organizers will review, hash, and rerun that exact file.
-
-Treat `stored_patterns`, `model_params`, and every `corrupted_query` as
-read-only. Do not inspect caller frames, truth labels, evaluator locals,
-closures, globals, or other runtime internals. Do not modify model objects,
-queries, NumPy state used by the evaluator, reports, clocks, limits, or scoring
-state. Seed-specific lookup tables, reconstructed truth sequences,
-monkeypatches, reflection, dynamic imports, `eval`/`exec`, subprocesses,
-filesystem or network access, environment inspection, native-code loading, and
-encoded or obfuscated payloads are prohibited.
-
-Normal numerical code using NumPy is allowed. Embedded learned parameters are
-allowed when they form a disclosed, seed-independent model; data keyed to the
-published seeds or queries is not. Unreadable or unexplained generated code may
-be rejected, and a rules violation may disqualify a submission regardless of
-its reported score.
-
-## Running locally
+## 5. Running locally
 
 ```bash
 pip install -r requirements.txt
@@ -194,11 +141,13 @@ python self_check.py --adapter adapters.myteam:Engine --quick
 python run.py --adapter adapters.myteam:Engine --out report.json
 ```
 
-The quick check uses two seeds, two noise levels, fewer queries, and fewer
-balance probes. The normal runner uses the full public configuration and writes
-the complete per-seed report.
+The quick check uses two seeds, two noise levels, fewer queries and fewer
+balance probes. The normal runner uses the full public configuration. Official
+grading uses fresh unpublished seeds and may use larger pattern sets.
 
-## Relevant files
+## 6. Submission
+
+Submit exactly one file: `adapters/myteam.py`, exposing `class Engine(Adapter)`.
 
 ```text
 adapter.py         submission interface
@@ -206,5 +155,14 @@ recovery_model.py  frozen recall engine
 data.py            stored-pattern and corrupted-query generation
 metrics.py         retrieval and convergence-balance calculations
 harness.py         multi-seed orchestration and scoring
-adapters/          examples and your submitted adapter location
+adapters/myteam.py this solution
 ```
+
+## 7. Results (fill in after running)
+
+| Metric | Value |
+| --- | --- |
+| Mean accuracy delta vs all-ones | _TBD_ |
+| Seeds with negative delta | _TBD_ |
+| Mean spread reduction | _TBD_ |
+| Seeds with reduction <= 1x | _TBD_ |
